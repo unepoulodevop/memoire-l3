@@ -1,0 +1,7 @@
+.vagrant/
+*.log
+*.retry
+.DS_Store
+kubeconfig
+*.pem
+*.key
