@@ -1,0 +1,45 @@
+# -*- mode: ruby -*-
+# vi: set ft=ruby :
+#
+# Vagrantfile — Mémoire L3 : Infrastructure résiliente
+# Provisionne 3 VMs Ubuntu Server 22.04 LTS formant un cluster K3s :
+#   - k3s-master (control plane)
+#   - k3s-worker-1, k3s-worker-2 (agents)
+#
+# Répartition mémoire : master léger (control plane seul, SQLite),
+# workers plus costauds (charges applicatives : app + MySQL).
+
+VMS = [
+  { name: "k3s-master",   ip: "192.168.56.10", memory: 1536, cpus: 1 },
+  { name: "k3s-worker-1", ip: "192.168.56.11", memory: 2048, cpus: 1 },
+  { name: "k3s-worker-2", ip: "192.168.56.12", memory: 2048, cpus: 1 },
+]
+
+Vagrant.configure("2") do |config|
+  config.vm.box = "ubuntu/jammy64" # Ubuntu Server 22.04 LTS
+
+  VMS.each do |vm_config|
+    config.vm.define vm_config[:name] do |node|
+      node.vm.hostname = vm_config[:name]
+
+      # Réseau privé dédié entre les 3 VMs (192.168.56.0/24)
+      node.vm.network "private_network", ip: vm_config[:ip]
+
+      node.vm.provider "virtualbox" do |vb|
+        vb.name   = vm_config[:name]
+        vb.memory = vm_config[:memory]
+        vb.cpus   = vm_config[:cpus]
+      end
+
+      # Provisionnement Ansible déclenché une fois toutes les VMs démarrées
+      # (n'est lancé qu'au dernier "vagrant up" pour cibler l'inventaire complet)
+      if vm_config[:name] == VMS.last[:name]
+        node.vm.provision "ansible" do |ansible|
+          ansible.playbook = "../ansible/playbooks/site.yml"
+          ansible.inventory_path = "../ansible/inventory/hosts.ini"
+          ansible.limit = "all"
+        end
+      end
+    end
+  end
+end
