@@ -17,7 +17,9 @@ VMS = [
 
 Vagrant.configure("2") do |config|
   config.vm.box = "ubuntu/jammy64" # Ubuntu Server 22.04 LTS
-
+  # Désactivation du dossier partagé par défaut (./ -> /vagrant sur la VM).
+  # Non nécessaire : toute la configuration passe par Ansible via SSH.
+  config.vm.synced_folder ".", "/vagrant", disabled: true
   VMS.each do |vm_config|
     config.vm.define vm_config[:name] do |node|
       node.vm.hostname = vm_config[:name]
