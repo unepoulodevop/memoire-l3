@@ -1,0 +1,48 @@
+---
+- name: Vérifier si K3s est déjà installé
+  ansible.builtin.stat:
+    path: /usr/local/bin/k3s
+  register: k3s_binary
+
+- name: Installer K3s en tant que serveur (control plane)
+  ansible.builtin.shell: >
+    curl -sfL https://get.k3s.io |
+    INSTALL_K3S_EXEC="--node-ip={{ private_ip }} --flannel-iface=eth1 --tls-san={{ private_ip }}"
+    sh -
+  when: not k3s_binary.stat.exists
+  environment:
+    INSTALL_K3S_VERSION: "v1.30.5+k3s1"
+
+- name: S'assurer que le service K3s est démarré et activé au boot
+  ansible.builtin.systemd:
+    name: k3s
+    state: started
+    enabled: true
+
+- name: Attendre que le fichier kubeconfig soit généré
+  ansible.builtin.wait_for:
+    path: /etc/rancher/k3s/k3s.yaml
+    timeout: 60
+
+- name: Attendre que le nœud soit prêt (kubectl get nodes)
+  ansible.builtin.command: k3s kubectl get nodes
+  register: k3s_node_status
+  until: "'Ready' in k3s_node_status.stdout"
+  retries: 10
+  delay: 5
+  changed_when: false
+
+- name: Lire le token de jonction du cluster
+  ansible.builtin.slurp:
+    src: /var/lib/rancher/k3s/server/node-token
+  register: k3s_token_raw
+
+- name: Enregistrer le token en tant que fait partagé
+  ansible.builtin.set_fact:
+    k3s_join_token: "{{ k3s_token_raw.content | b64decode | trim }}"
+
+- name: Récupérer le kubeconfig localement (pour kubectl/validation)
+  ansible.builtin.fetch:
+    src: /etc/rancher/k3s/k3s.yaml
+    dest: ../../k3s/kubeconfig
+    flat: true
