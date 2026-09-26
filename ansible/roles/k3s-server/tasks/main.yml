@@ -7,7 +7,7 @@
 - name: Installer K3s en tant que serveur (control plane)
   ansible.builtin.shell: >
     curl -sfL https://get.k3s.io |
-    INSTALL_K3S_EXEC="--node-ip={{ private_ip }} --flannel-iface=eth1 --tls-san={{ private_ip }}"
+    INSTALL_K3S_EXEC="--node-ip={{ private_ip }} --flannel-iface=enp0s8 --tls-san={{ private_ip }}"
     sh -
   when: not k3s_binary.stat.exists
   environment:
