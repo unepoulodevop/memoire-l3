@@ -1,0 +1,107 @@
+# StatefulSet du PRIMARY : le serveur MySQL qui accepte les écritures.
+# Un StatefulSet (et non un Deployment) garantit une identité stable
+# (mysql-primary-0) et un volume de données propre qui suit le pod.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mysql-primary
+  labels:
+    app.kubernetes.io/name: mysql
+    app.kubernetes.io/component: primary
+spec:
+  serviceName: mysql-primary
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: mysql
+      app.kubernetes.io/component: primary
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: mysql
+        app.kubernetes.io/component: primary
+    spec:
+      # Les pods MySQL ne sont jamais placés sur le master (1,5 Go de RAM seulement)
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+      containers:
+        - name: mysql
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: mysql
+              containerPort: 3306
+          # Les mots de passe viennent du Secret, jamais écrits dans les fichiers
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: MYSQL_ROOT_PASSWORD
+            - name: MYSQL_APP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: MYSQL_APP_PASSWORD
+            - name: MYSQL_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: MYSQL_REPLICATION_PASSWORD
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          # Test de connexion TCP réelle (127.0.0.1) : pendant l'initialisation,
+          # le serveur temporaire n'écoute pas en TCP, le pod n'est donc pas
+          # déclaré prêt trop tôt.
+          startupProbe:
+            exec:
+              command: ["bash", "-c", "mysqladmin ping -h127.0.0.1 -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
+            periodSeconds: 10
+            failureThreshold: 30
+          readinessProbe:
+            exec:
+              command: ["bash", "-c", "mysqladmin ping -h127.0.0.1 -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["bash", "-c", "mysqladmin ping -h127.0.0.1 -uroot -p\"$MYSQL_ROOT_PASSWORD\" --silent"]
+            periodSeconds: 20
+            timeoutSeconds: 5
+            failureThreshold: 3
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/mysql
+            - name: config
+              mountPath: /etc/mysql/conf.d/primary.cnf
+              subPath: primary.cnf
+            - name: init
+              mountPath: /docker-entrypoint-initdb.d
+      volumes:
+        - name: config
+          configMap:
+            name: mysql-config
+        - name: init
+          configMap:
+            name: mysql-config
+            defaultMode: 0755
+            items:
+              - key: 00-init-users.sh
+                path: 00-init-users.sh
+              - key: 01-schema.sql
+                path: 01-schema.sql
+  # Un volume persistant dédié, créé automatiquement pour le pod
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: {{ .Values.storage.storageClass }}
+        resources:
+          requests:
+            storage: {{ .Values.storage.size }}

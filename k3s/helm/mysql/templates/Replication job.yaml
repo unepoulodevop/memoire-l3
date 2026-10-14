@@ -1,0 +1,67 @@
+# Job de mise en place de la réplication.
+# Hook Helm : lancé automatiquement après "helm install" et "helm upgrade".
+# Le script est idempotent : si la réplication tourne déjà, il ne fait rien.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mysql-replication-setup
+  annotations:
+    "helm.sh/hook": post-install,post-upgrade
+    # Supprime l'ancien Job avant d'en recréer un (les Jobs sont immutables)
+    "helm.sh/hook-delete-policy": before-hook-creation
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: setup
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          env:
+            - name: MYSQL_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: MYSQL_ROOT_PASSWORD
+            - name: MYSQL_REPLICATION_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secretName }}
+                  key: MYSQL_REPLICATION_PASSWORD
+          command: ["bash", "-c"]
+          args:
+            - |
+              set -e
+              # 1. Attendre que les deux serveurs répondent
+              for host in mysql-primary mysql-replica; do
+                until mysqladmin ping -h "$host" -uroot -p"$MYSQL_ROOT_PASSWORD" --silent; do
+                  echo "En attente de $host..."
+                  sleep 5
+                done
+                echo "$host est prêt"
+              done
+
+              # 2. Ne rien faire si la réplication tourne déjà
+              if mysql -h mysql-replica -uroot -p"$MYSQL_ROOT_PASSWORD" -e "SHOW REPLICA STATUS\G" | grep -q "Replica_IO_Running: Yes"; then
+                echo "Réplication déjà active, rien à faire."
+                exit 0
+              fi
+
+              # 3. Brancher le replica sur le primary
+              mysql -h mysql-replica -uroot -p"$MYSQL_ROOT_PASSWORD" <<EOSQL
+              STOP REPLICA;
+              CHANGE REPLICATION SOURCE TO
+                SOURCE_HOST='mysql-primary',
+                SOURCE_PORT=3306,
+                SOURCE_USER='replicator',
+                SOURCE_PASSWORD='${MYSQL_REPLICATION_PASSWORD}',
+                SOURCE_AUTO_POSITION=1,
+                GET_SOURCE_PUBLIC_KEY=1;
+              START REPLICA;
+              -- Le replica refuse toute écriture, même celles de root
+              SET PERSIST super_read_only=ON;
+              EOSQL
+
+              # 4. Afficher l'état final
+              sleep 10
+              mysql -h mysql-replica -uroot -p"$MYSQL_ROOT_PASSWORD" -e "SHOW REPLICA STATUS\G" | grep -E "Replica_IO_Running|Replica_SQL_Running|Source_Host|Last_.*Error"
