@@ -1,0 +1,87 @@
+# ConfigMap : configuration des serveurs MySQL et scripts d'initialisation.
+# Elle est montée dans les pods par les StatefulSets (fichiers suivants du chart).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mysql-config
+  labels:
+    app.kubernetes.io/name: mysql
+    app.kubernetes.io/managed-by: {{ .Release.Service }}
+data:
+  # ---------- Configuration du PRIMARY (seul nœud qui accepte les écritures) ----------
+  primary.cnf: |
+    [mysqld]
+    # Identifiant unique du serveur dans la topologie de réplication
+    server-id=1
+    # Active le journal binaire : c'est lui que le replica lit pour se synchroniser
+    log-bin=mysql-bin
+    binlog_expire_logs_seconds={{ .Values.mysqlConfig.binlogExpireLogsSeconds }}
+    # GTID : chaque transaction reçoit un identifiant global, ce qui simplifie
+    # la reprise et la promotion d'un replica
+    gtid_mode=ON
+    enforce_gtid_consistency=ON
+    # Économie de mémoire (VM de 2 Go) : désactive l'instrumentation de performance
+    performance_schema=OFF
+    innodb_buffer_pool_size={{ .Values.mysqlConfig.innodbBufferPoolSize }}
+    max_connections={{ .Values.mysqlConfig.maxConnections }}
+    character-set-server=utf8mb4
+
+  # ---------- Configuration du REPLICA (copie synchronisée, prête à être promue) ----------
+  replica.cnf: |
+    [mysqld]
+    server-id=2
+    # Le replica garde lui aussi un journal binaire : indispensable pour qu'il
+    # puisse devenir primary après une panne
+    log-bin=mysql-bin
+    log_replica_updates=ON
+    binlog_expire_logs_seconds={{ .Values.mysqlConfig.binlogExpireLogsSeconds }}
+    gtid_mode=ON
+    enforce_gtid_consistency=ON
+    performance_schema=OFF
+    innodb_buffer_pool_size={{ .Values.mysqlConfig.innodbBufferPoolSize }}
+    max_connections={{ .Values.mysqlConfig.maxConnections }}
+    character-set-server=utf8mb4
+
+  # ---------- Script d'initialisation (PRIMARY uniquement, une seule fois) ----------
+  # L'image officielle exécute les fichiers de /docker-entrypoint-initdb.d
+  # par ordre alphabétique, à la première initialisation du volume.
+  00-init-users.sh: |
+    #!/bin/bash
+    set -e
+    mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" <<EOSQL
+    CREATE DATABASE IF NOT EXISTS {{ .Values.database.name }} CHARACTER SET utf8mb4;
+    -- Utilisateur de l'application : droits minimaux (lecture, insertion, mise à jour)
+    CREATE USER IF NOT EXISTS '{{ .Values.database.user }}'@'%' IDENTIFIED BY '${MYSQL_APP_PASSWORD}';
+    GRANT SELECT, INSERT, UPDATE ON {{ .Values.database.name }}.* TO '{{ .Values.database.user }}'@'%';
+    -- Utilisateur dédié à la réplication : ce seul droit lui suffit
+    CREATE USER IF NOT EXISTS 'replicator'@'%' IDENTIFIED BY '${MYSQL_REPLICATION_PASSWORD}';
+    GRANT REPLICATION SLAVE ON *.* TO 'replicator'@'%';
+    EOSQL
+
+  # ---------- Schéma et données de démonstration ----------
+  01-schema.sql: |
+    USE {{ .Values.database.name }};
+
+    CREATE TABLE IF NOT EXISTS products (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      price DECIMAL(10,2) NOT NULL,
+      stock INT NOT NULL DEFAULT 0
+    ) ENGINE=InnoDB;
+
+    CREATE TABLE IF NOT EXISTS orders (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      product_id INT NOT NULL,
+      customer_name VARCHAR(100) NOT NULL,
+      quantity INT NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (product_id) REFERENCES products(id)
+    ) ENGINE=InnoDB;
+
+    INSERT INTO products (name, price, stock) VALUES
+      ('Casque audio sans fil', 59.90, 25),
+      ('Clavier mécanique', 89.00, 15),
+      ('Souris ergonomique', 34.50, 40),
+      ('Écran 24 pouces', 149.99, 10),
+      ('Webcam HD', 45.00, 20),
+      ('Disque SSD 500 Go', 69.90, 30);

@@ -1,0 +1,8 @@
+apiVersion: v2
+name: mysql-replication
+description: Réplication MySQL asynchrone primary/replica (GTID) — Mémoire L3, infrastructure résiliente
+type: application
+# Version du chart : à incrémenter à chaque modification du chart
+version: 0.1.0
+# Version de MySQL déployée (branche LTS 8.4)
+appVersion: "8.4.11"
