@@ -1,0 +1,76 @@
+# Deployment : maintient le nombre voulu de copies de l'application en vie
+# et remplace automatiquement un pod qui disparaît.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ecommerce-app
+  labels:
+    app.kubernetes.io/name: ecommerce-app
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: ecommerce-app
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: ecommerce-app
+    spec:
+      affinity:
+        # Jamais sur le master
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: node-role.kubernetes.io/control-plane
+                    operator: DoesNotExist
+        # Préfère répartir les copies sur des nœuds différents : si un worker
+        # tombe, l'autre copie continue de répondre
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: ecommerce-app
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - name: http
+              containerPort: 5000
+          # Configuration lue par app.py via os.environ
+          env:
+            - name: MYSQL_HOST
+              value: {{ .Values.database.host | quote }}
+            - name: MYSQL_PORT
+              value: {{ .Values.database.port | quote }}
+            - name: MYSQL_DATABASE
+              value: {{ .Values.database.name | quote }}
+            - name: MYSQL_USER
+              value: {{ .Values.database.user | quote }}
+            # Le mot de passe vient du Secret, jamais écrit dans un fichier
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.secret.name }}
+                  key: {{ .Values.secret.key }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          # Prêt = la page /healthz répond : le pod reçoit alors du trafic
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          # Vivant = le port répond. Test volontairement simple : une panne de
+          # la base ne doit pas faire redémarrer les pods de l'application.
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+            failureThreshold: 3

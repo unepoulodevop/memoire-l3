@@ -1,0 +1,8 @@
+apiVersion: v2
+name: ecommerce-app
+description: Application e-commerce Flask (catalogue + commandes) — Mémoire L3, infrastructure résiliente
+type: application
+# Version du chart : à incrémenter à chaque modification du chart
+version: 0.1.0
+# Version de l'application (tag de l'image Docker)
+appVersion: "1.0"
