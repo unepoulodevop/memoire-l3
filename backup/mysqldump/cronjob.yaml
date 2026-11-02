@@ -1,0 +1,89 @@
+# Sauvegarde logique nocturne de la base ecommerce (mysqldump).
+# Appliqué avec : kubectl apply -f cronjob.yaml
+#
+# 1) Un volume persistant dédié aux sauvegardes, distinct de ceux de MySQL.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-backups
+  labels:
+    app.kubernetes.io/name: mysql-backup
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 2Gi
+---
+# 2) Une tâche planifiée qui lance la sauvegarde chaque nuit.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: mysql-backup
+  labels:
+    app.kubernetes.io/name: mysql-backup
+spec:
+  # Tous les jours à 02h00 (le Sénégal est à UTC+0, comme le cluster)
+  schedule: "0 2 * * *"
+  # Jamais deux sauvegardes en même temps
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 2
+      activeDeadlineSeconds: 600
+      template:
+        spec:
+          restartPolicy: OnFailure
+          # Les sauvegardes sont stockées sur le nœud maître, distinct des deux
+          # nœuds qui hébergent le primary et le réplica : la perte d'un worker
+          # ne détruit donc jamais les sauvegardes.
+          nodeSelector:
+            node-role.kubernetes.io/control-plane: "true"
+          containers:
+            - name: dump
+              image: mysql:8.4.11
+              env:
+                - name: MYSQL_BACKUP_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: mysql-credentials
+                      key: MYSQL_BACKUP_PASSWORD
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 64Mi
+                limits:
+                  memory: 256Mi
+              command: ["bash", "-c"]
+              args:
+                - |
+                  set -euo pipefail
+                  STAMP=$(date +%Y%m%d-%H%M%S)
+                  FILE=/backups/ecommerce-${STAMP}.sql.gz
+
+                  # 1. Export depuis le réplica (le primary n'est pas sollicité)
+                  echo "Sauvegarde de la base ecommerce depuis mysql-replica..."
+                  mysqldump -h mysql-replica -ubackup -p"$MYSQL_BACKUP_PASSWORD" \
+                    --single-transaction --routines --triggers --no-tablespaces \
+                    --set-gtid-purged=OFF --default-character-set=utf8mb4 \
+                    --databases ecommerce | gzip > "${FILE}.tmp"
+
+                  # 2. Contrôles : archive lisible et contenant bien les données
+                  gzip -t "${FILE}.tmp"
+                  zcat "${FILE}.tmp" | grep -q 'INSERT INTO `products`'
+                  mv "${FILE}.tmp" "${FILE}"
+
+                  # 3. Rotation : suppression des sauvegardes de plus de 7 jours
+                  find /backups -name 'ecommerce-*.sql.gz' -mtime +7 -delete
+
+                  echo "Sauvegarde terminée :"
+                  ls -lh /backups
+              volumeMounts:
+                - name: backups
+                  mountPath: /backups
+          volumes:
+            - name: backups
+              persistentVolumeClaim:
+                claimName: mysql-backups
