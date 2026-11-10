@@ -1,13 +1,44 @@
-# Stockage objet compatible S3 (MinIO) qui recevra les sauvegardes Velero.
-# Prérequis : namespace "velero" et Secret "minio-credentials" créés à la main
+# Stockage objet compatible S3 (Garage) qui recevra les sauvegardes Velero.
+# Remplace MinIO, dont les images publiques ont été retirées.
+# Prérequis : namespace "velero" et Secret "garage-credentials" créés à la main
 # (le Secret n'est jamais versionné dans Git).
-# Appliqué avec : kubectl apply -f minio.yaml
+# Appliqué avec : kubectl apply -f garage.yaml
 #
-# 1) Volume persistant pour les objets (sauvegardes)
+# 1) Configuration de Garage (le secret RPC n'est PAS ici : il vient du Secret)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: garage-config
+  namespace: velero
+data:
+  garage.toml: |
+    # Où Garage range ses métadonnées et ses données (volume persistant)
+    metadata_dir = "/var/lib/garage/meta"
+    data_dir = "/var/lib/garage/data"
+    db_engine = "lmdb"
+
+    # Un seul nœud : une seule copie de chaque objet
+    replication_factor = 1
+
+    # Communication interne de Garage (un seul nœud, donc locale)
+    rpc_bind_addr = "[::]:3901"
+    rpc_public_addr = "127.0.0.1:3901"
+
+    # API S3 : c'est elle que Velero utilisera
+    [s3_api]
+    s3_region = "garage"
+    api_bind_addr = "[::]:3900"
+    root_domain = ".s3.garage"
+
+    # API d'administration (non exposée hors du pod)
+    [admin]
+    api_bind_addr = "[::]:3903"
+---
+# 2) Volume persistant (métadonnées et objets)
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: minio-data
+  name: garage-data
   namespace: velero
 spec:
   accessModes: ["ReadWriteOnce"]
@@ -16,14 +47,14 @@ spec:
     requests:
       storage: 3Gi
 ---
-# 2) Le serveur MinIO (1 réplica), placé sur le master
+# 3) Le serveur Garage (1 réplica), placé sur le master
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: minio
+  name: garage
   namespace: velero
   labels:
-    app.kubernetes.io/name: minio
+    app.kubernetes.io/name: garage
 spec:
   replicas: 1
   # Volume RWO : on arrête l'ancien pod avant d'en démarrer un nouveau
@@ -31,92 +62,73 @@ spec:
     type: Recreate
   selector:
     matchLabels:
-      app.kubernetes.io/name: minio
+      app.kubernetes.io/name: garage
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: minio
+        app.kubernetes.io/name: garage
     spec:
       # Sur le master : séparé des workers qui hébergent MySQL
       nodeSelector:
         node-role.kubernetes.io/control-plane: "true"
       containers:
-        - name: minio
-          image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
-          args: ["server", "/data", "--console-address", ":9001"]
-          envFrom:
-            - secretRef:
-                name: minio-credentials
+        - name: garage
+          image: dxflrs/garage:v1.0.1
+          env:
+            # Secret partagé de Garage, lu depuis le Secret Kubernetes
+            - name: GARAGE_RPC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: garage-credentials
+                  key: GARAGE_RPC_SECRET
           ports:
             - name: s3
-              containerPort: 9000
+              containerPort: 3900
+          # Garage n'a pas de shell : on teste simplement que le port S3 répond
           readinessProbe:
-            httpGet:
-              path: /minio/health/ready
-              port: 9000
-            initialDelaySeconds: 10
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 5
             periodSeconds: 10
           livenessProbe:
-            httpGet:
-              path: /minio/health/live
-              port: 9000
-            initialDelaySeconds: 20
+            tcpSocket:
+              port: 3900
+            initialDelaySeconds: 15
             periodSeconds: 20
           resources:
             requests:
-              cpu: 50m
-              memory: 96Mi
+              cpu: 25m
+              memory: 32Mi
             limits:
-              memory: 192Mi
+              memory: 128Mi
           volumeMounts:
+            - name: config
+              mountPath: /etc/garage.toml
+              subPath: garage.toml
             - name: data
-              mountPath: /data
+              mountPath: /var/lib/garage/meta
+              subPath: meta
+            - name: data
+              mountPath: /var/lib/garage/data
+              subPath: data
       volumes:
+        - name: config
+          configMap:
+            name: garage-config
         - name: data
           persistentVolumeClaim:
-            claimName: minio-data
+            claimName: garage-data
 ---
-# 3) Service interne : Velero joindra MinIO via http://minio.velero.svc:9000
+# 4) Service interne : Velero joindra Garage via http://garage.velero.svc:3900
 apiVersion: v1
 kind: Service
 metadata:
-  name: minio
+  name: garage
   namespace: velero
 spec:
   selector:
-    app.kubernetes.io/name: minio
+    app.kubernetes.io/name: garage
   ports:
     - name: s3
-      port: 9000
-      targetPort: 9000
----
-# 4) Job unique : crée le bucket "velero" (idempotent)
-apiVersion: batch/v1
-kind: Job
-metadata:
-  name: minio-create-bucket
-  namespace: velero
-spec:
-  backoffLimit: 6
-  template:
-    spec:
-      restartPolicy: OnFailure
-      nodeSelector:
-        node-role.kubernetes.io/control-plane: "true"
-      containers:
-        - name: mc
-          image: minio/mc:RELEASE.2025-04-16T18-13-26Z
-          envFrom:
-            - secretRef:
-                name: minio-credentials
-          env:
-            - name: MC_CONFIG_DIR
-              value: /tmp/.mc
-          command: ["sh", "-c"]
-          args:
-            - |
-              until mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do
-                echo "MinIO pas encore prêt, nouvel essai..."; sleep 3
-              done
-              mc mb --ignore-existing local/velero
-              mc ls local
+      port: 3900
+      targetPort: 3900
