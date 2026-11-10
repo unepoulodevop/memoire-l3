@@ -1,0 +1,122 @@
+# Stockage objet compatible S3 (MinIO) qui recevra les sauvegardes Velero.
+# Prérequis : namespace "velero" et Secret "minio-credentials" créés à la main
+# (le Secret n'est jamais versionné dans Git).
+# Appliqué avec : kubectl apply -f minio.yaml
+#
+# 1) Volume persistant pour les objets (sauvegardes)
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-data
+  namespace: velero
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 3Gi
+---
+# 2) Le serveur MinIO (1 réplica), placé sur le master
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: velero
+  labels:
+    app.kubernetes.io/name: minio
+spec:
+  replicas: 1
+  # Volume RWO : on arrête l'ancien pod avant d'en démarrer un nouveau
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: minio
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: minio
+    spec:
+      # Sur le master : séparé des workers qui hébergent MySQL
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: minio
+          image: quay.io/minio/minio:RELEASE.2025-04-22T22-12-26Z
+          args: ["server", "/data", "--console-address", ":9001"]
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          ports:
+            - name: s3
+              containerPort: 9000
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 50m
+              memory: 96Mi
+            limits:
+              memory: 192Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-data
+---
+# 3) Service interne : Velero joindra MinIO via http://minio.velero.svc:9000
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: velero
+spec:
+  selector:
+    app.kubernetes.io/name: minio
+  ports:
+    - name: s3
+      port: 9000
+      targetPort: 9000
+---
+# 4) Job unique : crée le bucket "velero" (idempotent)
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-create-bucket
+  namespace: velero
+spec:
+  backoffLimit: 6
+  template:
+    spec:
+      restartPolicy: OnFailure
+      nodeSelector:
+        node-role.kubernetes.io/control-plane: "true"
+      containers:
+        - name: mc
+          image: minio/mc:RELEASE.2025-04-16T18-13-26Z
+          envFrom:
+            - secretRef:
+                name: minio-credentials
+          env:
+            - name: MC_CONFIG_DIR
+              value: /tmp/.mc
+          command: ["sh", "-c"]
+          args:
+            - |
+              until mc alias set local http://minio:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"; do
+                echo "MinIO pas encore prêt, nouvel essai..."; sleep 3
+              done
+              mc mb --ignore-existing local/velero
+              mc ls local
